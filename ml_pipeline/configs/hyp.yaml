@@ -1,0 +1,43 @@
+# hyp.yaml - Project Kanto, Phase 2.
+#
+# Aggressive augmentation profile tuned to simulate mobile-camera capture
+# variance for the iNat21-Mini species classifier (yolov8n-cls):
+#   * Phone sensors with auto white balance / exposure -> wide HSV jitter.
+#   * Hand-held framing -> rotation, translation, scale, mild perspective.
+#   * Partial occlusion (finger over lens, leaves in frame, motion blur) ->
+#     random erasing.
+# Mixup / CutMix are intentionally OFF: they blend pixels across species
+# and corrupt the fine-grained class boundaries iNat21 needs.
+
+# --- Color / photometric ---------------------------------------------------
+hsv_h: 0.025          # hue jitter (default 0.015) - phone WB shifts
+hsv_s: 0.8            # saturation jitter (default 0.7)
+hsv_v: 0.6            # value/brightness jitter (default 0.4) - sun vs. shade
+
+# --- Geometric -------------------------------------------------------------
+degrees: 15.0         # +/- rotation, deg (default 0.0) - tilted hand-held shots
+translate: 0.15       # +/- fraction of image dim (default 0.1) - loose framing
+scale: 0.6            # +/- scale gain (default 0.5) - subject distance varies
+shear: 2.0            # +/- shear, deg
+perspective: 0.0005   # mild perspective warp - off-axis capture
+
+# --- Flips -----------------------------------------------------------------
+fliplr: 0.5           # left-right mirror is fine for almost all species
+flipud: 0.0           # vertical flip would invert natural silhouettes
+
+# --- Occlusion -------------------------------------------------------------
+erasing: 0.4          # random rectangular erase prob - partial occlusion sim
+
+# --- Crop ------------------------------------------------------------------
+crop_fraction: 1.0    # leave to `scale` to handle zoom; avoid double-cropping
+
+# --- Mix-style augs (DISABLED for fine-grained classification) -------------
+mixup: 0.0
+cutmix: 0.0
+mosaic: 0.0           # mosaic is a detection trick; off for cls
+copy_paste: 0.0       # segmentation-only
+
+# --- Auto-augment policy ---------------------------------------------------
+# RandAugment adds a stochastic chain of mild transforms on top of the
+# explicit values above; complements rather than replaces them.
+auto_augment: randaugment
