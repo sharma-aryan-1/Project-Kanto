@@ -32,8 +32,10 @@ be invoked from the command line.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import re
 import tarfile
 from collections import defaultdict
 from pathlib import Path
@@ -68,6 +70,34 @@ DEFAULT_PROCESSED_DIR = Path("ml_pipeline/data/processed")
 # 0. Download / extract helpers
 # ---------------------------------------------------------------------------
 
+class IntegrityError(RuntimeError):
+    """Raised when a downloaded file fails a size or checksum check."""
+
+
+# `s3cmd` writes a `key:value/key:value/...` blob into the
+# `x-amz-meta-s3cmd-attrs` user-metadata header at upload time. iNaturalist's
+# AWS Open Data objects use this to publish the source MD5, e.g.:
+#   atime:.../md5:db6ed8330e634445efc8fec83ae81442/mode:.../uname:gvanhorn
+_S3CMD_MD5_RE = re.compile(r"(?:^|/)md5:([0-9a-fA-F]{32})(?:/|$)")
+
+
+def _md5_from_s3_metadata(headers) -> Optional[str]:
+    """Best-effort extraction of an MD5 from S3 `x-amz-meta-s3cmd-attrs`."""
+    raw = headers.get("x-amz-meta-s3cmd-attrs")
+    if not raw:
+        return None
+    match = _S3CMD_MD5_RE.search(raw)
+    return match.group(1).lower() if match else None
+
+
+def _md5_of_file(path: Path, chunk_size: int = 1 << 20) -> str:
+    hasher = hashlib.md5()
+    with open(path, "rb") as fp:
+        for chunk in iter(lambda: fp.read(chunk_size), b""):
+            hasher.update(chunk)
+    return hasher.hexdigest()
+
+
 def download_file(
     url: str,
     dest: str | os.PathLike,
@@ -76,13 +106,31 @@ def download_file(
     resume: bool = True,
     force: bool = False,
     timeout: float = 60.0,
+    expected_md5: Optional[str] = None,
+    use_s3_metadata_md5: bool = True,
+    delete_on_failure: bool = True,
 ) -> Path:
     """Stream-download `url` to `dest` with a tqdm progress bar.
 
-    * Skips the download if the file already exists with the expected size.
-    * Resumes a partial download via HTTP `Range` when the server reports
-      `Accept-Ranges: bytes` (important for the ~42 GB iNat21 image tar).
-    * Set `force=True` to ignore any existing file and re-download.
+    Integrity guarantees:
+
+    * After the stream completes, asserts the on-disk size equals
+      `Content-Length`. A short file raises `IntegrityError` instead of
+      silently leaving a truncated tar on disk.
+    * If `expected_md5` is provided (or auto-discovered from S3
+      `x-amz-meta-s3cmd-attrs` when `use_s3_metadata_md5=True`), the file
+      is hashed and compared. On mismatch, raises `IntegrityError` and,
+      when `delete_on_failure=True`, removes the bad file so the next
+      run starts cleanly instead of silently resuming on top of garbage.
+
+    Resume behaviour:
+
+    * Skips the download entirely if the file already exists with the
+      expected size **and** the checksum (when known) matches.
+    * Otherwise, if the server advertises `Accept-Ranges: bytes` and
+      a partial file exists, sends `Range: bytes=N-` and appends.
+      The integrity check at the end will catch any prior corruption.
+    * `force=True` ignores any existing file and re-downloads from byte 0.
     """
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -92,9 +140,28 @@ def download_file(
     total = int(head.headers.get("Content-Length", 0))
     accepts_ranges = head.headers.get("Accept-Ranges", "").lower() == "bytes"
 
+    if expected_md5 is None and use_s3_metadata_md5:
+        expected_md5 = _md5_from_s3_metadata(head.headers)
+    if expected_md5:
+        expected_md5 = expected_md5.lower()
+
     if not force and dest.exists() and total > 0 and dest.stat().st_size == total:
-        print(f"[skip] already complete: {dest.name} ({total / 1e9:.2f} GB)")
-        return dest
+        if expected_md5:
+            print(f"[verify] {dest.name}: hashing existing {total / 1e9:.2f} GB...")
+            actual = _md5_of_file(dest)
+            if actual == expected_md5:
+                print(f"[skip] already complete + verified: {dest.name}")
+                return dest
+            print(
+                f"[corrupt] {dest.name}: md5 {actual} != expected {expected_md5}; "
+                "re-downloading from scratch."
+            )
+            if delete_on_failure:
+                dest.unlink(missing_ok=True)
+            force = True
+        else:
+            print(f"[skip] already complete (size only): {dest.name} ({total / 1e9:.2f} GB)")
+            return dest
 
     headers: dict[str, str] = {}
     mode = "wb"
@@ -126,19 +193,49 @@ def download_file(
                     continue
                 f.write(chunk)
                 pbar.update(len(chunk))
+
+    final_size = dest.stat().st_size
+    if total > 0 and final_size != total:
+        if delete_on_failure:
+            dest.unlink(missing_ok=True)
+        raise IntegrityError(
+            f"{dest.name}: short download (got {final_size:,} bytes, "
+            f"expected {total:,}). The connection likely dropped mid-stream."
+        )
+
+    if expected_md5:
+        print(f"[verify] {dest.name}: hashing {final_size / 1e9:.2f} GB...")
+        actual = _md5_of_file(dest)
+        if actual != expected_md5:
+            if delete_on_failure:
+                dest.unlink(missing_ok=True)
+            raise IntegrityError(
+                f"{dest.name}: md5 mismatch (got {actual}, expected {expected_md5}). "
+                "The local file was corrupt (likely a torn write or dirty resume); "
+                "it has been deleted. Re-run to download a fresh copy."
+            )
+        print(f"[verify] {dest.name}: md5 OK ({expected_md5})")
+
     return dest
 
 
 def extract_tar_gz(
     archive_path: str | os.PathLike,
     dest_dir: str | os.PathLike,
+    *,
+    ignore_zeros: bool = False,
 ) -> Path:
-    """Extract a `.tar.gz` archive into `dest_dir` with a per-member progress bar."""
+    """Extract a `.tar.gz` archive into `dest_dir` with a per-member progress bar.
+
+    `ignore_zeros=True` keeps scanning past empty (zero-block) records, which
+    is necessary for tar archives produced by concatenating multiple smaller
+    tars. Default is `False` to preserve standard POSIX behaviour.
+    """
     archive_path = Path(archive_path)
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
 
-    with tarfile.open(archive_path, "r:gz") as tf:
+    with tarfile.open(archive_path, "r:gz", ignore_zeros=ignore_zeros) as tf:
         members = tf.getmembers()
         for member in tqdm(
             members,
@@ -149,7 +246,6 @@ def extract_tar_gz(
             try:
                 tf.extract(member, path=dest_dir, filter="data")
             except TypeError:
-                # Python < 3.12 has no `filter` kwarg.
                 tf.extract(member, path=dest_dir)
     return dest_dir
 
@@ -296,6 +392,9 @@ def inat21_to_taxonomy_csv(
     json_path: str | os.PathLike,
     images_root: str | os.PathLike,
     output_csv_path: str | os.PathLike,
+    *,
+    validate_paths: bool = False,
+    drop_missing: bool = False,
 ) -> pd.DataFrame:
     """Parse iNaturalist-2021 JSON into a flat taxonomy CSV.
 
@@ -312,6 +411,10 @@ def inat21_to_taxonomy_csv(
     Output columns (strict order):
         image_path, class_id, kingdom, phylum, class, order,
         family, genus, scientific_name, common_name
+
+    When `validate_paths=True`, every produced row is `Path.exists()`-checked
+    and a per-class missing-file count is printed. Set `drop_missing=True`
+    to also filter the CSV down to rows whose JPG actually lives on disk.
     """
     json_path = Path(json_path)
     images_root = Path(images_root)
@@ -349,6 +452,31 @@ def inat21_to_taxonomy_csv(
         rows.append(row)
 
     df = pd.DataFrame(rows, columns=list(TAXONOMY_CSV_COLUMNS))
+
+    if validate_paths:
+        tqdm.pandas(desc="check file exists", ascii=True)
+        exists_mask = df["image_path"].progress_apply(lambda p: Path(p).exists())
+        missing_count = int((~exists_mask).sum())
+        present_count = int(exists_mask.sum())
+        print(
+            f"[validate] {present_count:,}/{len(df):,} files present on disk; "
+            f"{missing_count:,} missing."
+        )
+        if missing_count:
+            missing_classes = df.loc[~exists_mask, "class_id"].nunique()
+            full_classes = df.loc[exists_mask, "class_id"].nunique()
+            print(
+                f"[validate] missing rows span {missing_classes:,} class_ids; "
+                f"{full_classes:,} class_ids have at least one file on disk."
+            )
+            missing_log = output_csv_path.with_suffix(".missing.txt")
+            df.loc[~exists_mask, "image_path"].to_csv(
+                missing_log, index=False, header=False
+            )
+            print(f"[validate] wrote missing-file list to {missing_log}")
+        if drop_missing:
+            df = df.loc[exists_mask].reset_index(drop=True)
+
     output_csv_path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(output_csv_path, index=False)
     return df
@@ -360,9 +488,19 @@ def fetch_inat21_mini(
     *,
     skip_download: bool = False,
     skip_extract: bool = False,
+    force: bool = False,
     output_csv_name: str = "taxonomy_map.csv",
+    validate_paths: bool = False,
+    drop_missing: bool = False,
+    extract_ignore_zeros: bool = False,
 ) -> pd.DataFrame:
-    """End-to-end iNat21 Mini pipeline: download, extract, parse."""
+    """End-to-end iNat21 Mini pipeline: download, extract, parse.
+
+    Set `force=True` to delete any local archives and re-download from
+    scratch. The download step always verifies S3's published MD5 (read
+    from `x-amz-meta-s3cmd-attrs`) and refuses to proceed with a corrupt
+    file.
+    """
     raw_dir = Path(raw_dir)
     processed_dir = Path(processed_dir)
     raw_dir.mkdir(parents=True, exist_ok=True)
@@ -371,14 +509,21 @@ def fetch_inat21_mini(
     images_archive = raw_dir / "train_mini.tar.gz"
     annot_archive = raw_dir / "train_mini.json.tar.gz"
     annot_json = raw_dir / "train_mini.json"
+    train_mini_dir = raw_dir / "train_mini"
 
     if not skip_download:
-        download_file(INAT21_MINI_ANNOTATIONS_URL, annot_archive)
-        download_file(INAT21_MINI_IMAGES_URL, images_archive)
+        download_file(INAT21_MINI_ANNOTATIONS_URL, annot_archive, force=force)
+        download_file(INAT21_MINI_IMAGES_URL, images_archive, force=force)
 
     if not skip_extract:
-        extract_tar_gz(annot_archive, raw_dir)
-        extract_tar_gz(images_archive, raw_dir)
+        # If we just re-downloaded, nuke any half-extracted directory so
+        # the new extraction doesn't sit next to stale species folders.
+        if force and train_mini_dir.exists():
+            import shutil
+            print(f"[clean] removing stale extraction at {train_mini_dir}")
+            shutil.rmtree(train_mini_dir, ignore_errors=True)
+        extract_tar_gz(annot_archive, raw_dir, ignore_zeros=extract_ignore_zeros)
+        extract_tar_gz(images_archive, raw_dir, ignore_zeros=extract_ignore_zeros)
 
     if not annot_json.exists():
         raise FileNotFoundError(
@@ -391,6 +536,8 @@ def fetch_inat21_mini(
         json_path=annot_json,
         images_root=raw_dir,
         output_csv_path=output_csv,
+        validate_paths=validate_paths,
+        drop_missing=drop_missing,
     )
     print(
         f"[done] wrote {len(df):,} taxonomy rows across "
@@ -617,6 +764,32 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Reuse already-extracted files; do not unpack the archives.",
     )
     inat.add_argument(
+        "--force",
+        action="store_true",
+        help=(
+            "Delete any local archives and re-download from scratch. "
+            "Use this if a previous download was corrupt (md5 mismatch)."
+        ),
+    )
+    inat.add_argument(
+        "--validate-paths",
+        action="store_true",
+        help="After parsing, check every CSV row's JPG actually exists on disk.",
+    )
+    inat.add_argument(
+        "--drop-missing",
+        action="store_true",
+        help="With --validate-paths, also drop rows whose JPG is missing.",
+    )
+    inat.add_argument(
+        "--extract-ignore-zeros",
+        action="store_true",
+        help=(
+            "Pass ignore_zeros=True to tarfile (needed for tars built by "
+            "concatenating multiple smaller tars)."
+        ),
+    )
+    inat.add_argument(
         "--output-csv-name",
         default="taxonomy_map.csv",
         help="Filename for the taxonomy CSV (default: %(default)s).",
@@ -645,7 +818,11 @@ def main(argv: Optional[list[str]] = None) -> None:
             processed_dir=args.processed_dir,
             skip_download=args.skip_download,
             skip_extract=args.skip_extract,
+            force=args.force,
             output_csv_name=args.output_csv_name,
+            validate_paths=args.validate_paths,
+            drop_missing=args.drop_missing,
+            extract_ignore_zeros=args.extract_ignore_zeros,
         )
 
 
