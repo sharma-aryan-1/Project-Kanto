@@ -131,6 +131,16 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--batch", type=int, default=64)
     p.add_argument("--patience", type=int, default=10, help="early-stopping patience")
     p.add_argument(
+        "--workers",
+        type=int,
+        default=4,
+        help=(
+            "DataLoader worker processes (default: %(default)s). Drop to 2 "
+            "or 0 if the machine is thermally / power constrained; the "
+            "Ultralytics default of 8 can saturate a laptop CPU."
+        ),
+    )
+    p.add_argument(
         "--project",
         default=str(DEFAULT_PROJECT_DIR),
         help="Parent directory for run artifacts (default: %(default)s).",
@@ -193,7 +203,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     print("[train]  starting training")
     print(
         f"         epochs={args.epochs}  imgsz={args.imgsz}  "
-        f"batch={args.batch}  patience={args.patience}  device={device}"
+        f"batch={args.batch}  workers={args.workers}  "
+        f"patience={args.patience}  device={device}"
     )
     print(f"         project={project_dir}/{args.name}")
     print("-" * 72)
@@ -204,6 +215,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             epochs=args.epochs,
             imgsz=args.imgsz,
             batch=args.batch,
+            workers=args.workers,
             patience=args.patience,
             device=device,
             project=str(project_dir),
@@ -220,6 +232,25 @@ def main(argv: Optional[list[str]] = None) -> int:
             "        Try a smaller --batch (e.g. 32 or 16) or smaller --imgsz.",
             file=sys.stderr,
         )
+        return 1
+    except NotImplementedError as exc:
+        msg = str(exc)
+        if "torchvision::nms" in msg and "CUDA" in msg:
+            import torchvision
+            print(
+                f"[error] torchvision::nms is not available on CUDA.\n"
+                f"        torch={torch.__version__}, "
+                f"torchvision={torchvision.__version__}\n"
+                "        torchvision was installed as the CPU-only build "
+                "but torch has CUDA support.\n"
+                "        Reinstall torchvision from the matching CUDA index, e.g.\n"
+                "          pip install --index-url "
+                "https://download.pytorch.org/whl/cu118 torchvision==0.19.1",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"[error] training failed: {exc}", file=sys.stderr)
+        traceback.print_exc()
         return 1
     except Exception as exc:
         print(f"[error] training failed: {exc}", file=sys.stderr)
