@@ -160,6 +160,34 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Allow overwriting an existing run directory.",
     )
+    p.add_argument(
+        "--save-period",
+        type=int,
+        default=1,
+        help=(
+            "Save a checkpoint every N epochs. Default 1 means a recoverable "
+            "checkpoint after every epoch, so a mid-run crash loses at most "
+            "one epoch of progress. Set to -1 to save only at end of training."
+        ),
+    )
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume from the most recent checkpoint at "
+            "<project>/<name>/weights/last.pt. Pass alongside the same --name "
+            "as the original run."
+        ),
+    )
+    p.add_argument(
+        "--fraction",
+        type=float,
+        default=1.0,
+        help=(
+            "Fraction of the training set to use (0.0-1.0). Defaults to 1.0. "
+            "Useful for short pipeline-validation runs (e.g. --fraction 0.05)."
+        ),
+    )
     return p
 
 
@@ -188,23 +216,39 @@ def main(argv: Optional[list[str]] = None) -> int:
         print(f"[error] device selection failed: {exc}", file=sys.stderr)
         return 1
 
-    print(f"[model]  loading pretrained weights: {args.model}")
+    project_dir = Path(args.project).resolve()
+    project_dir.mkdir(parents=True, exist_ok=True)
+
+    weights_to_load = args.model
+    if args.resume:
+        last_pt = project_dir / args.name / "weights" / "last.pt"
+        if not last_pt.exists():
+            print(
+                f"[error] --resume given but no checkpoint at {last_pt}",
+                file=sys.stderr,
+            )
+            return 2
+        weights_to_load = str(last_pt)
+        print(f"[resume] continuing from checkpoint: {last_pt}")
+
+    print(f"[model]  loading weights: {weights_to_load}")
     try:
-        model = YOLO(args.model)
+        model = YOLO(weights_to_load)
     except Exception as exc:
-        print(f"[error] failed to load model '{args.model}': {exc}", file=sys.stderr)
+        print(f"[error] failed to load model '{weights_to_load}': {exc}", file=sys.stderr)
         traceback.print_exc()
         return 1
     print(f"[model]  YOLOv8 task: {model.task}")
-
-    project_dir = Path(args.project).resolve()
-    project_dir.mkdir(parents=True, exist_ok=True)
 
     print("[train]  starting training")
     print(
         f"         epochs={args.epochs}  imgsz={args.imgsz}  "
         f"batch={args.batch}  workers={args.workers}  "
         f"patience={args.patience}  device={device}"
+    )
+    print(
+        f"         save_period={args.save_period}  fraction={args.fraction}  "
+        f"resume={args.resume}"
     )
     print(f"         project={project_dir}/{args.name}")
     print("-" * 72)
@@ -220,7 +264,10 @@ def main(argv: Optional[list[str]] = None) -> int:
             device=device,
             project=str(project_dir),
             name=args.name,
-            exist_ok=args.exist_ok,
+            exist_ok=args.exist_ok or args.resume,
+            save_period=args.save_period,
+            fraction=args.fraction,
+            resume=args.resume,
             **hyp,
         )
     except KeyboardInterrupt:
