@@ -5,27 +5,34 @@ Loads the trained YOLOv8 classification checkpoint, runs Ultralytics export to
 INT8 TFLite (with calibration images from the YOLO dataset), then copies the
 artifact into the Flutter asset bundle as `best_int8.tflite`.
 
+By default, exactly ``--calib-samples`` images are drawn from ``val/`` using a
+stratified round-robin over shuffled class IDs (wide class coverage; not the
+full 100k val set). A tiny YOLO-format ``train/`` + ``val/`` tree is written to
+``--calib-subset-dir`` and passed to Ultralytics with ``fraction=1.0``.
+
 Run (from repo root):
     python ml_pipeline/src/export.py
-    python ml_pipeline/src/export.py --data /path/to/yolo_dataset
+    python ml_pipeline/src/export.py --calib-samples 1000 --calib-seed 42
+    python ml_pipeline/src/export.py --calib-samples 0 --fraction 0.01
 
-INT8 TFLite export pulls in TensorFlow via Ultralytics; if the exporter errors on
-a missing dependency, install TensorFlow for your platform (see Ultralytics
-TFLite integration docs).
+INT8 TFLite export pulls in TensorFlow via Ultralytics; align TF/onnx/protobuf
+versions in a dedicated venv if you hit import errors (see prior Colab / Windows notes).
 
-Large val splits: Ultralytics concatenates all calibration images into one tensor
-for TF INT8; the default script caps calibration image count (--calib-cap) so
-runs stay within typical RAM limits.
+Large val splits without stratified subset: Ultralytics concatenates all calibration
+images into one tensor; use ``--calib-samples 0`` with ``--fraction`` / ``--calib-cap``.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import random
 import shutil
 import sys
 import traceback
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 from ultralytics import YOLO
 
@@ -34,8 +41,9 @@ DEFAULT_DATA_DIR = Path("ml_pipeline/data/processed/yolo_dataset")
 DEFAULT_RUN_DIR = Path("ml_pipeline/runs/yolov8n-cls-inat21-mini-a100")
 DEFAULT_WEIGHTS_NAME = "best.pt"
 DEFAULT_FLUTTER_MODEL = Path("app/assets/model/best_int8.tflite")
-# Ultralytics INT8 SavedModel export does torch.cat() over *all* calibration batches at
-# once (~N * 3 * imgsz^2 * 4 bytes FP32 after interpolate). Cap N unless --fraction is set.
+DEFAULT_CALIB_SUBSET_DIR = Path("ml_pipeline/data/processed/int8_calib_subset")
+DEFAULT_CALIB_SAMPLES = 500
+# When calib-samples is 0: Ultralytics INT8 path torch.cat()s all calibration batches.
 DEFAULT_CALIB_IMAGE_CAP = 1000
 _IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 
@@ -55,7 +63,7 @@ def resolve_dataset_path(data_arg: str) -> Path:
             f"expected `train/` and `val/` under {path}; "
             f"found train={train_dir.is_dir()}, val={val_dir.is_dir()}"
         )
-    print(f"[data]   calibration / dataset root: {path}")
+    print(f"[data]   source yolo_dataset root: {path}")
     return path
 
 
@@ -74,6 +82,130 @@ def count_val_images(val_dir: Path) -> int:
         if f.is_file() and f.suffix.lower() in _IMAGE_EXT:
             n += 1
     return n
+
+
+def _list_class_images_val(val_root: Path) -> dict[str, List[Path]]:
+    buckets: dict[str, List[Path]] = {}
+    for d in val_root.iterdir():
+        if not d.is_dir():
+            continue
+        imgs = [
+            p
+            for p in d.iterdir()
+            if p.is_file() and p.suffix.lower() in _IMAGE_EXT
+        ]
+        if imgs:
+            buckets[d.name] = imgs
+    return buckets
+
+
+def stratified_round_robin_sample(
+    buckets: dict[str, List[Path]],
+    n: int,
+    rng: random.Random,
+) -> List[Tuple[str, Path]]:
+    """Round-robin over shuffled class IDs; maximizes distinct classes for the first n picks."""
+    if n < 1:
+        raise ValueError("calib-samples must be at least 1 when building stratified subset")
+    classes = list(buckets.keys())
+    if not classes:
+        raise ValueError("No class folders with images found under val/")
+    rng.shuffle(classes)
+
+    unused: dict[str, List[Path]] = {c: buckets[c][:] for c in classes}
+    for c in unused:
+        rng.shuffle(unused[c])
+
+    used_count: dict[str, int] = {c: 0 for c in classes}
+    samples: List[Tuple[str, Path]] = []
+
+    def pick_one() -> Optional[Tuple[str, Path]]:
+        for c in classes:
+            k = used_count[c]
+            pool = unused[c]
+            if k < len(pool):
+                path = pool[k]
+                used_count[c] = k + 1
+                return (c, path)
+        return None
+
+    for _ in range(n):
+        got = pick_one()
+        if got is None:
+            raise ValueError(
+                f"Not enough validation images to sample {n} items "
+                f"(stopped at {len(samples)})."
+            )
+        samples.append(got)
+
+    return samples
+
+
+def materialize_calib_subset(
+    samples: List[Tuple[str, Path]],
+    out_root: Path,
+    *,
+    use_hardlink: bool = False,
+) -> None:
+    """Write train/ and val/ trees (Ultralytics cls checks need both)."""
+    if out_root.exists():
+        shutil.rmtree(out_root)
+    train_root = out_root / "train"
+    val_root = out_root / "val"
+    train_root.mkdir(parents=True, exist_ok=True)
+    val_root.mkdir(parents=True, exist_ok=True)
+
+    for i, (class_id, src) in enumerate(samples):
+        dest_name = f"{i:06d}_{src.name}"
+        tdir = train_root / class_id
+        vdir = val_root / class_id
+        tdir.mkdir(parents=True, exist_ok=True)
+        vdir.mkdir(parents=True, exist_ok=True)
+        tpath = tdir / dest_name
+        vpath = vdir / dest_name
+        if use_hardlink:
+            try:
+                os.link(src, tpath)
+                os.link(tpath, vpath)
+            except OSError:
+                shutil.copy2(src, tpath)
+                shutil.copy2(src, vpath)
+        else:
+            shutil.copy2(src, tpath)
+            shutil.copy2(src, vpath)
+
+
+def build_stratified_calib_dataset(
+    yolo_root: Path,
+    n_samples: int,
+    out_root: Path,
+    *,
+    seed: Optional[int],
+    use_hardlink: bool,
+    manifest_path: Optional[Path],
+) -> Tuple[Path, int]:
+    """Return (subset_root_path, distinct_class_count)."""
+    val_root = yolo_root / "val"
+    rng = random.Random(seed)
+    buckets = _list_class_images_val(val_root)
+    samples = stratified_round_robin_sample(buckets, n_samples, rng)
+    distinct = len({c for c, _ in samples})
+    materialize_calib_subset(samples, out_root, use_hardlink=use_hardlink)
+
+    if manifest_path is not None:
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        payload = [
+            {"index": i, "class_id": c, "source": str(p.resolve())}
+            for i, (c, p) in enumerate(samples)
+        ]
+        manifest_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        print(f"[calib]  wrote manifest {manifest_path}")
+
+    print(
+        f"[calib]  stratified subset: {len(samples)} images, "
+        f"{distinct} distinct class IDs -> {out_root}"
+    )
+    return out_root.resolve(), distinct
 
 
 def resolve_calibration_fraction(
@@ -99,11 +231,12 @@ def resolve_calibration_fraction(
         f"[calib]  val images: {n_val:,}  fraction: {frac:.6g} ({mode})  "
         f"~{n_calib:,} images for TensorFlow calibration"
     )
-    approx_ram_gib = (n_calib * 3 * (imgsz**2) * 4) / (1024**3)  # FP32 BCHW ballpark
+    approx_ram_gib = (n_calib * 3 * (imgsz**2) * 4) / (1024**3)
     if n_calib > cap or approx_ram_gib >= 4.0:
         print(
             f"[calib]  note: Ultralytics stacks calibration tensors in RAM (~{approx_ram_gib:.1f} GiB "
-            f"order-of-magnitude at imgsz={imgsz}). Omit --fraction to auto-cap, or lower --fraction further."
+            f"order-of-magnitude at imgsz={imgsz}). "
+            "Raise default --calib-samples or use --calib-cap / lower --fraction."
         )
     return frac, n_calib, n_val
 
@@ -127,7 +260,6 @@ def _mb(num_bytes: int) -> float:
 
 def _export_output_path_hint(weights_pt: Path) -> Path:
     """Where Ultralytics typically writes INT8 TFLite for a given .pt path."""
-    # See ultralytics.engine.exporter.Exporter.export_tflite (int8 branch).
     saved_model = Path(str(weights_pt).replace(weights_pt.suffix, "_saved_model"))
     return saved_model / f"{weights_pt.stem}_int8.tflite"
 
@@ -149,7 +281,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--data",
         default=str(DEFAULT_DATA_DIR),
-        help="yolo_dataset root for INT8 calibration (default: %(default)s).",
+        help="Full yolo_dataset root (train/ + val/); val/ is sampled from here (default: %(default)s).",
     )
     p.add_argument(
         "--flutter-out",
@@ -163,23 +295,50 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Square export image size (default: %(default)s).",
     )
     p.add_argument(
+        "--calib-samples",
+        type=int,
+        default=DEFAULT_CALIB_SAMPLES,
+        help=(
+            "If > 0, build a stratified subset of exactly this many val images and use it for INT8 "
+            "(export fraction=1.0). If 0, use the full yolo_dataset with --fraction / --calib-cap. "
+            "Default: %(default)s."
+        ),
+    )
+    p.add_argument(
+        "--calib-seed",
+        type=int,
+        default=None,
+        help="RNG seed for stratified sampling (default: OS entropy).",
+    )
+    p.add_argument(
+        "--calib-subset-dir",
+        default=str(DEFAULT_CALIB_SUBSET_DIR),
+        help="Where to write the temporary train/val calib subset (default: %(default)s).",
+    )
+    p.add_argument(
+        "--calib-hardlink",
+        action="store_true",
+        help="Try hardlinks into calib subset (same volume; falls back to copy).",
+    )
+    p.add_argument(
+        "--calib-manifest",
+        default=None,
+        help="Optional JSON path listing sampled class_id + source image paths.",
+    )
+    p.add_argument(
         "--fraction",
         type=float,
         default=None,
         help=(
-            "Fraction of val images for INT8 calibration (0.0-1.0). "
-            "If omitted, fraction is chosen from --calib-cap so Ultralytics does not torch.cat "
-            "the full val split (which needs tens of GiB RAM for large iNat-style sets)."
+            "Only when --calib-samples 0: fraction of val for calibration (0-1). "
+            "If omitted, --calib-cap sets an automatic cap."
         ),
     )
     p.add_argument(
         "--calib-cap",
         type=int,
         default=DEFAULT_CALIB_IMAGE_CAP,
-        help=(
-            "When --fraction is omitted, use at most this many val images "
-            "(fraction = min(1, cap / n_val)). Default: %(default)s."
-        ),
+        help="Only when --calib-samples 0: max val images via fraction=min(1,cap/n). Default: %(default)s.",
     )
     return p
 
@@ -198,31 +357,57 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 2
 
     try:
-        fraction, _n_calib, _n_val = resolve_calibration_fraction(
-            args.fraction,
-            data_path / "val",
-            args.calib_cap,
-            args.imgsz,
-        )
-    except ValueError as exc:
-        print(f"[error] {exc}", file=sys.stderr)
-        return 2
-
-    try:
         run_dir = Path(args.run_dir).expanduser().resolve()
         weights_pt = locate_best_weights(run_dir, args.weights_name)
     except FileNotFoundError as exc:
         print(f"[error] {exc}", file=sys.stderr)
         return 2
 
+    export_data: Path
+    export_fraction: float
+
+    if args.calib_samples > 0:
+        if args.fraction is not None or args.calib_cap != DEFAULT_CALIB_IMAGE_CAP:
+            print(
+                "[calib]  note: --fraction / --calib-cap are ignored when --calib-samples > 0.",
+                file=sys.stderr,
+            )
+        subset_root = Path(args.calib_subset_dir).expanduser().resolve()
+        man = Path(args.calib_manifest).expanduser().resolve() if args.calib_manifest else None
+        try:
+            export_data, _distinct = build_stratified_calib_dataset(
+                data_path,
+                args.calib_samples,
+                subset_root,
+                seed=args.calib_seed,
+                use_hardlink=args.calib_hardlink,
+                manifest_path=man,
+            )
+        except ValueError as exc:
+            print(f"[error] {exc}", file=sys.stderr)
+            return 2
+        export_fraction = 1.0
+    else:
+        try:
+            export_fraction, _n_calib, _n_val = resolve_calibration_fraction(
+                args.fraction,
+                data_path / "val",
+                args.calib_cap,
+                args.imgsz,
+            )
+        except ValueError as exc:
+            print(f"[error] {exc}", file=sys.stderr)
+            return 2
+        export_data = data_path
+
     flutter_out = Path(args.flutter_out).expanduser().resolve()
     pt_bytes = weights_pt.stat().st_size
 
     print(
         f"[export] format=tflite  int8=True  imgsz={args.imgsz}  "
-        f"fraction={fraction}"
+        f"fraction={export_fraction}"
     )
-    print(f"[export] data={data_path}")
+    print(f"[export] data={export_data}")
 
     try:
         model = YOLO(str(weights_pt))
@@ -230,8 +415,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             format="tflite",
             int8=True,
             imgsz=args.imgsz,
-            data=str(data_path),
-            fraction=fraction,
+            data=str(export_data),
+            fraction=export_fraction,
         )
     except Exception as exc:
         print(f"[error] export failed: {exc}", file=sys.stderr)
