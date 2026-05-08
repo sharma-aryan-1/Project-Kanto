@@ -10,6 +10,7 @@ Future<void> main() async {
 
   final isarService = IsarService();
   await isarService.initialize();
+  await isarService.seedDatabase();
 
   runApp(
     ProviderScope(

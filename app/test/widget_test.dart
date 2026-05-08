@@ -2,10 +2,8 @@ import 'package:app/core/models/species.dart';
 import 'package:app/core/providers.dart';
 import 'package:app/core/services/isar_service.dart';
 import 'package:app/main.dart';
-import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
-
 /// In-memory stand-in so widget tests avoid opening a real Isar database.
 class _TestIsarService extends IsarService {
   Species? _speciesAtZero;
@@ -24,6 +22,9 @@ class _TestIsarService extends IsarService {
     row.isCaught = true;
     row.caughtDate = DateTime.utc(2026, 5, 8);
   }
+
+  @override
+  Future<void> seedDatabase() async {}
 
   @override
   Future<void> insertDummyData() async {
