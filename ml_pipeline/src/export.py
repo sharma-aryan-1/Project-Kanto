@@ -41,6 +41,7 @@ DEFAULT_DATA_DIR = Path("ml_pipeline/data/processed/yolo_dataset")
 DEFAULT_RUN_DIR = Path("ml_pipeline/runs/yolov8n-cls-inat21-mini-a100")
 DEFAULT_WEIGHTS_NAME = "best.pt"
 DEFAULT_FLUTTER_MODEL = Path("app/assets/model/best_int8.tflite")
+DEFAULT_FLUTTER_FLOAT_MODEL = Path("app/assets/model/best_float.tflite")
 DEFAULT_CALIB_SUBSET_DIR = Path("ml_pipeline/data/processed/int8_calib_subset")
 DEFAULT_CALIB_SAMPLES = 500
 # When calib-samples is 0: Ultralytics INT8 path torch.cat()s all calibration batches.
@@ -266,7 +267,7 @@ def _export_output_path_hint(weights_pt: Path) -> Path:
 
 def _build_arg_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
-        description="Export YOLOv8-cls to INT8 TFLite and copy into Flutter assets.",
+        description="Export YOLOv8-cls to TFLite (INT8 or float32) and copy into Flutter assets.",
     )
     p.add_argument(
         "--run-dir",
@@ -285,9 +286,22 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--flutter-out",
-        default=str(DEFAULT_FLUTTER_MODEL),
-        help="Destination .tflite path in the Flutter tree (default: %(default)s).",
+        default=None,
+        help=(
+            "Destination .tflite in the Flutter tree. "
+            "Default: app/assets/model/best_int8.tflite or best_float.tflite from --no-int8."
+        ),
     )
+    p.add_argument(
+        "--no-int8",
+        dest="int8",
+        action="store_false",
+        help=(
+            "Export full-precision (float32) TFLite. "
+            "Use when INT8 hits missing-op / PAD errors in tflite_flutter on device."
+        ),
+    )
+    p.set_defaults(int8=True)
     p.add_argument(
         "--imgsz",
         type=int,
@@ -347,7 +361,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     args = _build_arg_parser().parse_args(argv)
 
     print("=" * 72)
-    print("  Project Kanto - Phase 3: INT8 TFLite export")
+    print("  Project Kanto - Phase 3: TFLite export (INT8 or float32)")
     print("=" * 72)
 
     try:
@@ -400,11 +414,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 2
         export_data = data_path
 
-    flutter_out = Path(args.flutter_out).expanduser().resolve()
+    if args.flutter_out is not None:
+        flutter_out = Path(args.flutter_out).expanduser().resolve()
+    elif args.int8:
+        flutter_out = DEFAULT_FLUTTER_MODEL.resolve()
+    else:
+        flutter_out = DEFAULT_FLUTTER_FLOAT_MODEL.resolve()
     pt_bytes = weights_pt.stat().st_size
 
     print(
-        f"[export] format=tflite  int8=True  imgsz={args.imgsz}  "
+        f"[export] format=tflite  int8={args.int8}  imgsz={args.imgsz}  "
         f"fraction={export_fraction}"
     )
     print(f"[export] data={export_data}")
@@ -413,7 +432,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         model = YOLO(str(weights_pt))
         exported = model.export(
             format="tflite",
-            int8=True,
+            int8=args.int8,
             imgsz=args.imgsz,
             data=str(export_data),
             fraction=export_fraction,
