@@ -1,6 +1,6 @@
 description: Ultralytics YOLOv8n-cls model trained on /content/Project-Kanto/ml_pipeline/data/processed/yolo_dataset
 author: Ultralytics
-date: '2026-05-08T17:19:02.166035'
+date: '2026-05-09T16:33:56.537454'
 version: 8.4.47
 license: AGPL-3.0 License (https://ultralytics.com/license)
 docs: https://docs.ultralytics.com
@@ -10012,7 +10012,7 @@ names:
   9998: '9998'
   9999: '9999'
 args:
-  data: /mnt/d/Project Kanto/ml_pipeline/data/processed/int8_calib_subset
+  data: null
   batch: 1
   fraction: 1.0
   half: false
