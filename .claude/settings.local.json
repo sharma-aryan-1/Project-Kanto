@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(wsl --list --verbose)",
-      "Bash(wsl bash *)",
-      "Bash(flutter analyze *)"
-    ]
-  }
-}

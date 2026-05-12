@@ -1,14 +1,26 @@
-# Core deps. Most of these install fine via plain pip from PyPI.
+# Project Kanto — Python ML pipeline dependencies.
 #
-# IMPORTANT: torch + torchvision must be installed from the matching CUDA
-# wheel index, otherwise pip will silently grab the CPU-only torchvision
-# wheel and `torchvision::nms` will fail on CUDA tensors at validation
-# time (manifests as a NotImplementedError mid-training). Install with:
+# Install:
+#
+#   pip install -r requirements.txt
+#
+# IMPORTANT — torch + torchvision must come from the matching CUDA wheel
+# index, otherwise pip silently grabs the CPU-only torchvision wheel and
+# `torchvision::nms` fails on CUDA tensors at validation time (manifests
+# as a NotImplementedError mid-training). After the line above, run:
 #
 #   pip install --index-url https://download.pytorch.org/whl/cu118 \
 #       torch==2.4.1 torchvision==0.19.1
 #
-# (or substitute cu121 / cpu / etc. to match your local CUDA toolkit).
+# (Substitute cu121 / cpu / etc. to match your local CUDA toolkit.)
+# `train.py` detects the exact `torchvision::nms` error and prints these
+# recovery instructions.
+#
+# TFLite export note — `python ml_pipeline/src/export.py` will trigger
+# Ultralytics to install `tensorflow`, `onnx2tf`, `onnx`, and related
+# pieces on first run. Those aren't pinned here because the version matrix
+# is brittle; let Ultralytics pick. Internet required for that first run.
+
 albumentations==1.4.18
 numpy==1.26.4
 opencv-python==4.10.0.84

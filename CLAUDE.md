@@ -8,11 +8,10 @@ Project Kanto is a two-part system: an offline mobile species classifier (the
 **app/** Flutter front-end) backed by a YOLOv8 nano classification model
 trained and quantized by the **ml_pipeline/** Python pipeline. The pipeline
 fine-tunes `yolov8n-cls.pt` on iNaturalist 2021 Mini (10,000 species), exports
-an INT8 TFLite model, and drops it into the Flutter asset bundle.
-
-The Flutter app source itself is not yet in the repo — only `app/assets/` is
-checked in (the bundled TFLite models and `taxonomy.json`). When app code
-appears, it consumes the artifacts produced by the export step.
+an INT8 (and float) TFLite model, and drops both into the Flutter asset
+bundle. The Flutter app then runs the float TFLite at 224×224 over a live
+camera feed and emits a top-3 ranked HUD via a temporally-smoothed softmax
+buffer. See the repo-root `README.md` for the full architecture write-up.
 
 ## Pipeline phases
 
@@ -116,10 +115,13 @@ PAD errors in `tflite_flutter` on device.
 
 There's a finished A100 reference run at
 `ml_pipeline/runs/yolov8n-cls-inat21-mini-a100/` (50 epochs, batch 384,
-imgsz 224 — see `args.yaml`). Per-epoch checkpoints (`epochN.pt`) are
-gitignored; only `best.pt`, `last.pt`, `best.onnx`, and the `best_saved_model/`
-TF artifact are tracked. `train.py --save-period 1` is intentional: a mid-run
-crash loses at most one epoch of progress.
+imgsz 224 — see `args.yaml`). Tracked: `best.pt` and `last.pt` (canonical
+training outputs), `args.yaml`, `results.csv`, and the confusion-matrix /
+training-curve PNGs — together a self-contained reproducibility artefact.
+Gitignored: per-epoch checkpoints (`epochN.pt`, ~10 MB each), and the
+intermediate export formats (`best.onnx` + `best_saved_model/`) since
+`export.py` regenerates both from `best.pt`. `train.py --save-period 1`
+is intentional: a mid-run crash loses at most one epoch of progress.
 
 ## Windows-specific notes
 
