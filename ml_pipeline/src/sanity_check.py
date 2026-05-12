@@ -23,8 +23,8 @@ from ultralytics import YOLO
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-DEFAULT_MODEL = REPO_ROOT / "app/assets/model/best_int8.tflite"
-DEFAULT_IMAGE = REPO_ROOT / "test_animal.jpg"
+DEFAULT_MODEL = REPO_ROOT / "app/assets/model/best_float.tflite"
+DEFAULT_IMAGE = REPO_ROOT / "app/assets/images/test_animal.jpg"
 DEFAULT_TAXONOMY_CSV = REPO_ROOT / "ml_pipeline/data/processed/taxonomy_map.csv"
 
 

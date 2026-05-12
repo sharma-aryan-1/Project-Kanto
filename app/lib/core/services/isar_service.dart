@@ -1,6 +1,7 @@
 import 'dart:convert';
 
 import 'package:flutter/services.dart' show rootBundle;
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:isar/isar.dart';
 import 'package:path_provider/path_provider.dart';
 
@@ -53,3 +54,13 @@ class IsarService {
 
   Future<void> close() => _isar.close();
 }
+
+/// Opens Isar and seeds the species atlas on first launch. Cached for the
+/// lifetime of the ProviderScope; `ref.onDispose` closes the database when
+/// the scope itself tears down (e.g. on hot restart).
+final isarServiceProvider = FutureProvider<IsarService>((ref) async {
+  final service = await IsarService.open();
+  await service.seedDatabase();
+  ref.onDispose(service.close);
+  return service;
+});
