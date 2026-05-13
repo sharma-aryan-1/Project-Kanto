@@ -1,8 +1,8 @@
-# Project Kanto
+# Project Kanto: Real-life Pokedex
 
-An offline mobile species classifier. Point your phone's camera at a plant, bird, fungus, fish, or insect and the app names what it sees — no internet, no API calls, no telemetry. Everything runs on-device.
+An offline mobile pokedex-like species classifier. Point your phone's camera at a plant, bird, fungus, fish, or insect, and the app names what it sees. No internet, no API calls, no telemetry. Everything runs on-device.
 
-The Flutter app ships a YOLOv8n-cls model fine-tuned on iNaturalist 2021 Mini (10 000 species, 38 % top-1 / 68 % top-5 on the val split). The viewfinder displays the top-3 ranked predictions in real time with averaged confidences, so the practical hit rate tracks the top-5 number rather than top-1. End-to-end per-frame budget is ~150–200 ms on a mid-range Android device.
+The Flutter app ships a YOLOv8n-cls model fine-tuned on iNaturalist 2021 Mini (10,000 species, 38 % top-1 / 68 % top-5 on the val split). The viewfinder displays the top-3 ranked predictions in real time with averaged confidences, so the practical hit rate tracks the top-5 number rather than top-1. End-to-end per-frame budget is ~150–200 ms on a mid-range Android device.
 
 ```
 [ camera ] → decode → rotate 90° CW → centre-crop (0.65 of inscribed square)
@@ -146,3 +146,12 @@ UI threshold (`_kConfidenceThreshold` in `scanner_screen.dart`) is `0.0` — the
 - **WSL**: ML pipeline scripts run inside a `tf-env` conda environment with Python 3.11.
 - **Flutter Android**: `isar_flutter_libs` needs AGP 8 namespace patching, handled by a reflection-based shim in `app/android/build.gradle.kts` (placed before `evaluationDependsOn(":app")` — placing it after triggers "Project already evaluated").
 - **GPU delegate** for TFLite is *not* currently wired up. `tflite_flutter` 0.11 supports `GpuDelegateV2` on Android — would likely give 3–5× speed-up on convolutional models, but partial INT8 op support means it's worth a measured spike rather than a blind enable.
+
+
+
+## Future
+
+- UI/UX improvements
+- iOS testing
+- model finetuning with background as 10,001 class
+- model finetuning on full iNat dataset
