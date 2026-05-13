@@ -1,2 +1,34 @@
-# Auto detect text files and perform LF normalization
+# Auto-detect text files and perform LF normalization.
 * text=auto
+
+# ─── GitHub Linguist overrides ─────────────────────────────────────────────
+#
+# The project is Dart (the Flutter app) + Python (the ML pipeline). Without
+# these overrides, GitHub's language stats are dominated by auto-generated
+# platform scaffolding (Flutter's android/, ios/, macos/, linux/, windows/,
+# web/ directories) and report HTML/C++/CMake majorities that don't reflect
+# what we actually wrote.
+
+# Flutter platform scaffolding — every file in these directories is created
+# verbatim by `flutter create` and only edited at the margins.
+app/android/**          linguist-generated
+app/ios/**              linguist-generated
+app/macos/**            linguist-generated
+app/linux/**            linguist-generated
+app/windows/**          linguist-generated
+app/web/**              linguist-generated
+
+# build_runner outputs (Isar schema generation).
+app/lib/**/*.g.dart     linguist-generated
+
+# Embedded TFLite models + 10 000-entry taxonomy JSON. Binary blobs and
+# bundled data, not authored code.
+app/assets/**           linguist-vendored
+
+# Training-run artefacts (plots, CSVs, args.yaml). Produced by Ultralytics,
+# not hand-authored.
+ml_pipeline/runs/**     linguist-generated
+
+# Jupyter notebooks are exploratory / scratch work and dominate the stats
+# without reflecting the project's actual implementation language.
+*.ipynb                 linguist-documentation

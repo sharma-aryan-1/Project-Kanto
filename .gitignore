@@ -61,3 +61,7 @@ Desktop.ini
 .vscode/
 
 # Flutter project ignores live in app/.gitignore — don't duplicate here.
+
+
+# Extra
+resume-bullets.txt
